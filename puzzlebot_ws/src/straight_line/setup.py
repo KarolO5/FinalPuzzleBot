@@ -12,7 +12,7 @@ setup(
         'console_scripts': [
             'odometry    = straight_line.odometry:main',
             'pd_controller = straight_line.pd_controller:main',
-            'line_follower_cv      = line_follower.line_follower_cv:main',
+            'line_follower_cv = straight_line.line_follower_cv:main',
         ],
     },
 )

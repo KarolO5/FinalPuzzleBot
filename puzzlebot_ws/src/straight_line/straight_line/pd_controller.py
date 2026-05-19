@@ -56,7 +56,7 @@ class PDController(Node):
         now = self.get_clock().now().nanoseconds * 1e-9
         error = self.target_yaw - self.current_yaw
         error = math.atan2(math.sin(error), math.cos(error))
-        dt = (now - self.prev_time) if self.prev_time else 1e-3
+        dt = (now - self.prev_time) if self.prev_time is not None else 0.05
         d_error = (error - self.prev_error) / dt if dt > 0 else 0.0
         self.prev_error = error
         self.prev_time  = now
