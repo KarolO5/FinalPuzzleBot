@@ -13,6 +13,8 @@ setup(
             'odometry    = straight_line.odometry:main',
             'pd_controller = straight_line.pd_controller:main',
             'line_follower_cv = straight_line.line_follower_cv:main',
+            'camera_node      = straight_line.camera_node:main',  
+            #'sign_detector  = straight_line.sign_detector:main', # cuando esté listo
         ],
     },
 )

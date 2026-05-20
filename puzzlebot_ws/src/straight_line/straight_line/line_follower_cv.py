@@ -249,7 +249,7 @@ class LineFollowerCV(Node):
 
         # ── Subscribers ───────────────────────────────────────────────
         self.create_subscription(
-            Image, '/camera/image_raw', self._image_cb, qos_be
+            Image, '/image/raw', self._image_cb, qos_be
         )
         self.create_subscription(
             Odometry, '/odom', self._odom_cb, qos_be
