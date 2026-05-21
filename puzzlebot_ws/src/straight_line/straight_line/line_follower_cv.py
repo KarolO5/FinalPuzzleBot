@@ -47,9 +47,9 @@ from rclpy.qos          import QoSProfile, QoSReliabilityPolicy, QoSHistoryPolic
 # Robot
 WHEEL_RADIUS = 0.0525
 WHEEL_BASE   = 0.164
-MAX_LINEAR   = 0.15
+MAX_LINEAR   = 0.20
 MAX_ANGULAR  = 0.35
-LINEAR_VEL   = 0.10      # m/s de crucero (un poco menos para tener margen de giro)
+LINEAR_VEL   = 0.15      # m/s de crucero (un poco menos para tener margen de giro)
 
 # PD visual — error en píxeles normalizados [-1, 1]
 KP_VIS = 1.8             # Proporcional al error lateral de la línea
