@@ -36,7 +36,7 @@ from rclpy.node import Node
 from geometry_msgs.msg import Twist
 from nav_msgs.msg       import Odometry
 from sensor_msgs.msg    import Image
-from std_msgs.msg       import Float32
+from std_msgs.msg       import Float32, String
 from cv_bridge          import CvBridge
 from rclpy.qos          import QoSProfile, QoSReliabilityPolicy, QoSHistoryPolicy
 
@@ -238,6 +238,10 @@ class LineFollowerCV(Node):
         self._last_error  = 0.0       # último error válido (para recovery)
         self._frames_lost = 0         # frames consecutivos sin línea
 
+        # ── Estado semáforo ───────────────────────────────────────────
+        # Posibles: 'rojo', 'amarillo', 'verde', 'ninguno'
+        self._semaforo = 'ninguno'
+
         # ── Odometría (heredada de tu PD controller) ──────────────────
         self._current_yaw  = 0.0
         self._odom_ready   = False
@@ -254,6 +258,9 @@ class LineFollowerCV(Node):
         self.create_subscription(
             Odometry, '/odom', self._odom_cb, qos_be
         )
+        self.create_subscription(
+            String, '/semaforo/estado', self._semaforo_cb, 10
+        )
 
         self.get_logger().info(
             f'LineFollowerCV listo\n'
@@ -266,6 +273,14 @@ class LineFollowerCV(Node):
     def _odom_cb(self, msg: Odometry):
         self._current_yaw = yaw_from_quaternion(msg.pose.pose.orientation)
         self._odom_ready  = True
+
+    # ── Callback semáforo ──────────────────────────────────────────────
+
+    def _semaforo_cb(self, msg: String):
+        nuevo = msg.data
+        if nuevo != self._semaforo:
+            self.get_logger().info(f'Semáforo: {self._semaforo} → {nuevo}')
+        self._semaforo = nuevo
 
     # ── Callback imagen ────────────────────────────────────────────────
 
@@ -306,7 +321,23 @@ class LineFollowerCV(Node):
             v_izq = v_base - u
             v_der = v_base + u
         → publicadas como Twist (linear.x, angular.z).
+
+        Comportamiento semáforo:
+          • rojo    → robot detenido (espera a que cambie a verde)
+          • amarillo → velocidad lineal reducida a la mitad (sigue la línea)
+          • verde / ninguno → velocidad normal
         """
+        # ── Lógica de semáforo ────────────────────────────────────────
+        if self._semaforo == 'rojo':
+            # Detener completamente; no actualizar el PD
+            self._pub_cmd.publish(Twist())
+            self.get_logger().debug('Semáforo ROJO — detenido')
+            return
+
+        # Factor de velocidad según semáforo
+        vel_factor = 0.5 if self._semaforo == 'amarillo' else 1.0
+
+        # ── PD normal ─────────────────────────────────────────────────
         now = self.get_clock().now().nanoseconds * 1e-9
         dt  = (now - self._prev_time) if self._prev_time is not None else 0.02
         dt  = max(dt, 1e-4)
@@ -324,11 +355,12 @@ class LineFollowerCV(Node):
             u = KP_VIS * error_norm + KD_VIS * d_error
             u = clamp(u, -MAX_ANGULAR, MAX_ANGULAR)
 
-            cmd.linear.x  = LINEAR_VEL
+            cmd.linear.x  = LINEAR_VEL * vel_factor
             cmd.angular.z = u
 
             self.get_logger().debug(
                 f'e={error_norm:+.3f}  de={d_error:+.4f}  u={u:+.3f}'
+                f'  vel_factor={vel_factor}'
             )
 
         else:
@@ -337,7 +369,7 @@ class LineFollowerCV(Node):
             if self._frames_lost < RECOVERY_FRAMES:
                 # Inercia: mantener último giro suavizado
                 u = KP_VIS * self._last_error * 0.5
-                cmd.linear.x  = LINEAR_VEL * 0.5
+                cmd.linear.x  = LINEAR_VEL * vel_factor * 0.5
                 cmd.angular.z = clamp(u, -MAX_ANGULAR, MAX_ANGULAR)
             else:
                 # Búsqueda: girar hacia última dirección conocida
