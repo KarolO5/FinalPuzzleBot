@@ -2,20 +2,32 @@
 # =============================================================================
 # semaforo.py
 # =============================================================================
-# Detecta el color del semáforo (rojo, amarillo, verde) en la parte
-# superior-central de la imagen usando OpenCV (HSV + máscaras de color).
+# Detecta el color del semáforo (rojo, amarillo, verde) usando OpenCV (HSV).
 #
-# ROI: franja superior central del frame
-#   - Vertical  : 0 .. ROI_H_FRAC  (fracción superior, ej. 30 %)
-#   - Horizontal: centro ± ROI_W_HALF_FRAC (ej. ±25 % → 50 % central)
+# ROI: columna derecha del frame (donde físicamente está el semáforo en pista)
+#   - Horizontal : ROI_X_START .. 1.0  (fracción derecha, ej. 60-100 %)
+#   - Vertical   : 0 .. ROI_Y_END      (fracción superior, ej. 0-70 %)
+#
+# Motivo del cambio respecto a la versión anterior:
+#   La versión previa usaba la franja superior-central (top 30% × central 50%).
+#   Esto generaba falsos positivos con objetos coloridos en el centro de la
+#   imagen. El semáforo de la pista se ubica a la derecha del robot, por lo
+#   que restringir la ROI al lado derecho elimina ambigüedad y mejora la
+#   especificidad de la detección.
+#
+# EVIDENCIA
+#   Guarda hasta MAX_EVIDENCE imágenes por detección en ~/puzzlebot_evidence/semaforo/
+#   Mantiene solo las 5 más recientes (rota automáticamente).
 #
 # TÓPICOS
 # ────────
-#   Sub : /image/raw          [sensor_msgs/Image]   (desde camera_node)
-#   Pub : /semaforo/estado    [std_msgs/String]      ("rojo","amarillo","verde","ninguno")
-#   Pub : /semaforo/debug_img [sensor_msgs/Image]    (frame con ROI anotado)
+#   Sub : /image/raw          [sensor_msgs/Image]
+#   Pub : /semaforo/estado    [std_msgs/String]   ("rojo","amarillo","verde","ninguno")
+#   Pub : /semaforo/debug_img [sensor_msgs/Image]
 # =============================================================================
 
+import os
+import glob
 import cv2
 import numpy as np
 
@@ -27,15 +39,14 @@ from cv_bridge import CvBridge
 from rclpy.qos import QoSProfile, QoSReliabilityPolicy, QoSHistoryPolicy
 
 # ─────────────────────────────────────────────────────────────────────────────
-# PARÁMETROS DE ROI
+# PARÁMETROS DE ROI  (columna derecha del frame)
 # ─────────────────────────────────────────────────────────────────────────────
-ROI_H_FRAC      = 0.30   # fracción superior del frame (0–30 %)
-ROI_W_HALF_FRAC = 0.25   # mitad del ancho central (±25 % → 50 % del ancho)
+ROI_X_START = 0.60   # inicio horizontal (60 % desde la izquierda)
+ROI_Y_END   = 0.70   # fin vertical (top 70 % del frame)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # RANGOS HSV DE COLORES
 # ─────────────────────────────────────────────────────────────────────────────
-# Rojo aparece en dos rangos en HSV (cruza el 0/180)
 RED_LO1  = np.array([  0, 100,  80])
 RED_HI1  = np.array([ 10, 255, 255])
 RED_LO2  = np.array([165, 100,  80])
@@ -44,11 +55,33 @@ RED_HI2  = np.array([180, 255, 255])
 YELLOW_LO = np.array([ 18, 100,  80])
 YELLOW_HI = np.array([ 35, 255, 255])
 
-GREEN_LO  = np.array([ 40, 80,   60])
+GREEN_LO  = np.array([ 40,  80,  60])
 GREEN_HI  = np.array([ 90, 255, 255])
 
-# Mínimo de píxeles de color para considerar detección válida
 MIN_PIXELS = 150
+
+# ─────────────────────────────────────────────────────────────────────────────
+# EVIDENCIA
+# ─────────────────────────────────────────────────────────────────────────────
+MAX_EVIDENCE    = 5
+EVIDENCE_DIR    = os.path.expanduser('~/puzzlebot_evidence/semaforo')
+
+
+def _save_evidence(frame: np.ndarray, tag: str) -> None:
+    """Guarda una imagen de detección; mantiene solo MAX_EVIDENCE archivos."""
+    os.makedirs(EVIDENCE_DIR, exist_ok=True)
+    import time
+    ts   = int(time.time() * 1000)
+    path = os.path.join(EVIDENCE_DIR, f'{tag}_{ts}.jpg')
+    cv2.imwrite(path, frame)
+    _rotate_evidence(EVIDENCE_DIR, '*.jpg')
+
+
+def _rotate_evidence(directory: str, pattern: str) -> None:
+    """Elimina los archivos más antiguos si se supera MAX_EVIDENCE."""
+    files = sorted(glob.glob(os.path.join(directory, pattern)))
+    while len(files) > MAX_EVIDENCE:
+        os.remove(files.pop(0))
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -66,21 +99,18 @@ class SemaforoNode(Node):
             depth=1,
         )
 
-        self._bridge = CvBridge()
+        self._bridge       = CvBridge()
+        self._prev_estado  = 'ninguno'
 
-        # Publishers
         self._pub_estado = self.create_publisher(String, '/semaforo/estado',    10)
         self._pub_debug  = self.create_publisher(Image,  '/semaforo/debug_img', 10)
 
-        # Subscriber
         self.create_subscription(Image, '/image/raw', self._image_cb, qos_be)
 
         self.get_logger().info(
-            f'SemaforoNode listo | ROI superior {int(ROI_H_FRAC*100)}% '
-            f'x central {int(ROI_W_HALF_FRAC*200)}%'
+            f'SemaforoNode listo | ROI derecha x=[{int(ROI_X_START*100)}%,100%] '
+            f'y=[0%,{int(ROI_Y_END*100)}%]'
         )
-
-    # ── Callback principal ────────────────────────────────────────────────
 
     def _image_cb(self, msg: Image):
         try:
@@ -91,42 +121,33 @@ class SemaforoNode(Node):
 
         estado, debug_frame = self._detect(frame)
 
-        # Publicar estado
-        state_msg = String()
+        # Guardar evidencia solo cuando aparece una detección nueva (no "ninguno")
+        if estado != 'ninguno' and estado != self._prev_estado:
+            _save_evidence(debug_frame, estado)
+        self._prev_estado = estado
+
+        state_msg      = String()
         state_msg.data = estado
         self._pub_estado.publish(state_msg)
 
-        # Publicar debug
-        dbg_msg = self._bridge.cv2_to_imgmsg(debug_frame, encoding='bgr8')
+        dbg_msg        = self._bridge.cv2_to_imgmsg(debug_frame, encoding='bgr8')
         dbg_msg.header = msg.header
         self._pub_debug.publish(dbg_msg)
 
-    # ── Detección de color en ROI ─────────────────────────────────────────
-
     def _detect(self, frame: np.ndarray) -> tuple:
-        """
-        Analiza la ROI superior-central del frame.
-        Devuelve (estado: str, debug_frame: ndarray).
-        """
         h, w = frame.shape[:2]
 
-        # Calcular coordenadas del ROI
+        roi_x0 = int(w * ROI_X_START)
+        roi_x1 = w
         roi_y0 = 0
-        roi_y1 = int(h * ROI_H_FRAC)
-        cx     = w // 2
-        half_w = int(w * ROI_W_HALF_FRAC)
-        roi_x0 = max(0, cx - half_w)
-        roi_x1 = min(w, cx + half_w)
+        roi_y1 = int(h * ROI_Y_END)
 
-        roi = frame[roi_y0:roi_y1, roi_x0:roi_x1]
-
-        # Suavizado para reducir ruido
+        roi     = frame[roi_y0:roi_y1, roi_x0:roi_x1]
         blurred = cv2.GaussianBlur(roi, (7, 7), 0)
         hsv     = cv2.cvtColor(blurred, cv2.COLOR_BGR2HSV)
 
-        # Máscaras
-        mask_red    = (cv2.inRange(hsv, RED_LO1,  RED_HI1) |
-                       cv2.inRange(hsv, RED_LO2,  RED_HI2))
+        mask_red    = (cv2.inRange(hsv, RED_LO1, RED_HI1) |
+                       cv2.inRange(hsv, RED_LO2, RED_HI2))
         mask_yellow = cv2.inRange(hsv, YELLOW_LO, YELLOW_HI)
         mask_green  = cv2.inRange(hsv, GREEN_LO,  GREEN_HI)
 
@@ -134,33 +155,27 @@ class SemaforoNode(Node):
         px_yellow = int(cv2.countNonZero(mask_yellow))
         px_green  = int(cv2.countNonZero(mask_green))
 
-        # Determinar estado (prioridad: rojo > amarillo > verde)
         if px_red >= MIN_PIXELS and px_red >= px_yellow and px_red >= px_green:
-            estado     = 'rojo'
-            box_color  = (0, 0, 220)
+            estado    = 'rojo'
+            box_color = (0, 0, 220)
         elif px_yellow >= MIN_PIXELS and px_yellow >= px_green:
-            estado     = 'amarillo'
-            box_color  = (0, 200, 220)
+            estado    = 'amarillo'
+            box_color = (0, 200, 220)
         elif px_green >= MIN_PIXELS:
-            estado     = 'verde'
-            box_color  = (0, 200, 60)
+            estado    = 'verde'
+            box_color = (0, 200, 60)
         else:
-            estado     = 'ninguno'
-            box_color  = (120, 120, 120)
+            estado    = 'ninguno'
+            box_color = (120, 120, 120)
 
-        # ── Frame de depuración ───────────────────────────────────────
         debug = frame.copy()
-
-        # Rectángulo del ROI
         cv2.rectangle(debug, (roi_x0, roi_y0), (roi_x1, roi_y1), box_color, 2)
 
-        # Texto de estado sobre el ROI
         label = f'SEMAFORO: {estado.upper()} | R={px_red} A={px_yellow} V={px_green}'
         cv2.putText(debug, label,
-                    (roi_x0, max(roi_y1 + 18, 18)),
+                    (roi_x0, min(roi_y1 + 18, h - 4)),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.5, box_color, 2)
 
-        # Overlay de máscara ganadora dentro del ROI
         if estado == 'rojo':
             overlay_mask = mask_red
         elif estado == 'amarillo':
@@ -179,10 +194,6 @@ class SemaforoNode(Node):
 
         return estado, debug
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-# MAIN
-# ─────────────────────────────────────────────────────────────────────────────
 
 def main(args=None):
     rclpy.init(args=args)

@@ -15,7 +15,7 @@ setup(
             'line_follower_cv = straight_line.line_follower_cv:main',
             'camera_node      = straight_line.camera_node:main',  
             'semaforo         = straight_line.semaforo:main',
-            #'sign_detector  = straight_line.sign_detector:main', # cuando esté listo
+            'sign_detector    = straight_line.sign_detector:main',
         ],
     },
 )
