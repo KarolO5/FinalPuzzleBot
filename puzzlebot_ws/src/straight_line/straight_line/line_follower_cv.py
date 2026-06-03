@@ -65,7 +65,7 @@ LINEAR_VEL   = 0.13   # reducido de 0.15: menos velocidad → más tiempo para c
 # PD visual
 # KP bajo: menos reacción brusca ante error instantáneo
 # KD alto: amortigua oscilaciones
-KP_VIS = 1.2   # era 1.8 — reducido para suavizar respuesta
+KP_VIS = 0.9   # era 1.8 — reducido para suavizar respuesta
 KD_VIS = 0.45  # era 0.25 — aumentado para más amortiguamiento
 
 # Suavizado exponencial del error antes del PD  (0 = sin suavizado, 1 = congelar)
