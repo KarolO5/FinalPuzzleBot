@@ -50,20 +50,19 @@ from rclpy.qos          import QoSProfile, QoSReliabilityPolicy, QoSHistoryPolic
 WHEEL_RADIUS = 0.0525
 WHEEL_BASE   = 0.164
 MAX_LINEAR   = 0.20
-MAX_ANGULAR  = 0.15   # era 0.20 — techo de velocidad angular
-LINEAR_VEL   = 0.08   # era 0.15 — más lento = más tiempo para corregir
+MAX_ANGULAR  = 0.35   # valor original
+LINEAR_VEL   = 0.12   # ligeramente menor que el original (0.15) — solo cambio pedido
 
-# PD visual
-KP_VIS = 0.65   # era 0.9  — reacción más suave al error
-KD_VIS = 0.25   # era 0.40 — derivativo más bajo para evitar picos de velocidad angular
+# PD visual — valores originales del branch lineaSem
+KP_VIS = 1.8
+KD_VIS = 0.25
 
-# Filtro exponencial del error  alpha=0 → sin filtro  alpha→1 → muy suave
-# Con alpha=0.65 el robot tarda ~3 frames en responder a un cambio brusco de error
-ERROR_ALPHA = 0.65   # era 0.4
+# Filtro exponencial mínimo (casi transparente)
+# 0.0 = sin filtro (idéntico al original), subir solo si hay latigazos visibles
+ERROR_ALPHA = 0.15
 
-# Zona muerta angular: errores muy pequeños no generan corrección
-# Evita micro-oscilaciones en tramos rectos
-ANGULAR_DEADBAND = 0.04   # rad/s — si |u| < esto → angular.z = 0
+# Zona muerta desactivada (0.0 = siempre corrige, igual que el original)
+ANGULAR_DEADBAND = 0.0
 
 # Visión — ROI
 ROI_FRACTION  = 0.40
