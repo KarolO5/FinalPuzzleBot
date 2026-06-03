@@ -58,15 +58,15 @@ from rclpy.qos          import QoSProfile, QoSReliabilityPolicy, QoSHistoryPolic
 # ─────────────────────────────────────────────────────────────────────────────
 WHEEL_RADIUS = 0.0525
 WHEEL_BASE   = 0.164
-MAX_LINEAR   = 0.20
-MAX_ANGULAR  = 0.30   # reducido de 0.35 para limitar latigazos
+MAX_LINEAR   = 0.15
+MAX_ANGULAR  = 0.15   # reducido de 0.35 para limitar latigazos
 LINEAR_VEL   = 0.13   # reducido de 0.15: menos velocidad → más tiempo para corregir
 
 # PD visual
 # KP bajo: menos reacción brusca ante error instantáneo
 # KD alto: amortigua oscilaciones
 KP_VIS = 0.6   # era 1.8 — reducido para suavizar respuesta
-KD_VIS = 0.45  # era 0.25 — aumentado para más amortiguamiento
+KD_VIS = 0.40  # era 0.25 — aumentado para más amortiguamiento
 
 # Suavizado exponencial del error antes del PD  (0 = sin suavizado, 1 = congelar)
 # Reduce el ruido frame-a-frame que causa los latigazos de alta frecuencia
