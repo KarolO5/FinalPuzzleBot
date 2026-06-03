@@ -58,8 +58,8 @@ from rclpy.qos          import QoSProfile, QoSReliabilityPolicy, QoSHistoryPolic
 # ─────────────────────────────────────────────────────────────────────────────
 WHEEL_RADIUS = 0.0525
 WHEEL_BASE   = 0.164
-MAX_LINEAR   = 0.15
-MAX_ANGULAR  = 0.15   # reducido de 0.35 para limitar latigazos
+MAX_LINEAR   = 0.20
+MAX_ANGULAR  = 0.20   # reducido de 0.35 para limitar latigazos
 LINEAR_VEL   = 0.13   # reducido de 0.15: menos velocidad → más tiempo para corregir
 
 # PD visual
