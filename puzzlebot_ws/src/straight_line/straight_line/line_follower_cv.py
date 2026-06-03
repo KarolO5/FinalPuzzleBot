@@ -3,33 +3,24 @@
 # line_follower_cv.py
 # =============================================================================
 # Seguidor de línea negra con OpenCV + controlador PD.
-# Integra estado del semáforo y señales de tránsito.
 #
-# ── MÁQUINA DE ESTADOS ────────────────────────────────────────────────────────
-#
-#  FOLLOWING ──red light──► STOPPED_LIGHT (vel=0, espera verde)
-#  FOLLOWING ──STOP sign──► STOPPED_SIGN  (vel=0, 3 s, cooldown 10 s)
-#  FOLLOWING ──intersec+TurnR──► TURNING  (gira 90° con odometría)
-#  FOLLOWING ──intersec+TurnL──► TURNING  (gira -90° con odometría)
-#  FOLLOWING ──intersec+AOnly──► STRAIGHT_OVERRIDE (avanza recto N frames)
-#  Crossing visible       ──► vel_factor = 0.5
-#  Give activo            ──► vel_factor = 0.5 hasta próxima intersección
-#
-# ── INTERSECCIÓN ──────────────────────────────────────────────────────────────
-# Se detecta cuando ≥ INTERSECTION_MIN_COLS columnas del detector están activas
-# simultáneamente (la línea se ensancha en "T" o cruce).
-# Se dispara solo en la transición False→True para evitar activaciones repetidas.
+# ── FLAGS DE MÓDULOS (activar/desactivar sin borrar código) ──────────────────
+SEMAFORO_ENABLED = False   # True cuando semaforo.py esté en producción
+SIGNS_ENABLED    = False   # True cuando sign_detector.py esté en producción
+# ─────────────────────────────────────────────────────────────────────────────
 #
 # ── EVIDENCIA ────────────────────────────────────────────────────────────────
-# • Frame + máscara cada EVIDENCE_INTERVAL_S segundos.
-# • Mantiene solo MAX_EVIDENCE archivos por carpeta (rota el más antiguo).
+# Fotografía del frame cada EVIDENCE_INTERVAL_S segundos.
+# Máximo MAX_EVIDENCE_TOTAL fotos. Cuando se supera ese límite se eliminan
+# las MÁS RECIENTES (las últimas en tomarse), conservando siempre las primeras.
+# Esto permite ver las condiciones iniciales del recorrido.
 #
 # TÓPICOS
 # ────────
 #   Sub : /image/raw         [sensor_msgs/Image]
 #   Sub : /odom              [nav_msgs/Odometry]
-#   Sub : /semaforo/estado   [std_msgs/String]
-#   Sub : /sign/state        [std_msgs/String]
+#   Sub : /semaforo/estado   [std_msgs/String]   (solo si SEMAFORO_ENABLED)
+#   Sub : /sign/state        [std_msgs/String]   (solo si SIGNS_ENABLED)
 #   Pub : /cmd_vel           [geometry_msgs/Twist]
 #   Pub : /vision/debug_img  [sensor_msgs/Image]
 #   Pub : /vision/error      [std_msgs/Float32]
@@ -59,18 +50,16 @@ from rclpy.qos          import QoSProfile, QoSReliabilityPolicy, QoSHistoryPolic
 WHEEL_RADIUS = 0.0525
 WHEEL_BASE   = 0.164
 MAX_LINEAR   = 0.20
-MAX_ANGULAR  = 0.20   # reducido de 0.35 para limitar latigazos
-LINEAR_VEL   = 0.15   # reducido de 0.15: menos velocidad → más tiempo para corregir
+MAX_ANGULAR  = 0.20
+LINEAR_VEL   = 0.15
 
 # PD visual
-# KP bajo: menos reacción brusca ante error instantáneo
-# KD alto: amortigua oscilaciones
-KP_VIS = 0.9   # era 1.8 — reducido para suavizar respuesta
-KD_VIS = 0.40  # era 0.25 — aumentado para más amortiguamiento
+KP_VIS = 0.9
+KD_VIS = 0.40
 
-# Suavizado exponencial del error antes del PD  (0 = sin suavizado, 1 = congelar)
-# Reduce el ruido frame-a-frame que causa los latigazos de alta frecuencia
-ERROR_ALPHA = 0.4   # mezcla: error_filtrado = alpha*error_anterior + (1-alpha)*error_nuevo
+# Filtro exponencial sobre el error (0 = sin filtro, valores altos = más suave)
+# Sube ERROR_ALPHA si el robot sigue oscilando; bájalo si reacciona muy lento
+ERROR_ALPHA = 0.4
 
 # Visión — ROI
 ROI_FRACTION  = 0.40
@@ -81,66 +70,64 @@ BLUR_K        = 5
 THRESH_VAL    = 60
 MIN_CELL_FILL = 0.05
 
-# Recovery
+# Recovery (línea perdida)
 RECOVERY_FRAMES = 20
 RECOVERY_OMEGA  = 0.25
 
 # ─────────────────────────────────────────────────────────────────────────────
-# PARÁMETROS DE SEÑALES
+# PARÁMETROS DE SEÑALES (solo usados si los flags están activos)
 # ─────────────────────────────────────────────────────────────────────────────
-INTERSECTION_MIN_COLS = 6     # columnas activas para detectar intersección
-STOP_SIGN_DURATION    = 3.0   # segundos detenido ante señal STOP
-STOP_SIGN_COOLDOWN    = 10.0  # cooldown entre activaciones de STOP
-CROSSING_VEL_FACTOR   = 0.5   # factor de velocidad para Crossing
-GIVE_VEL_FACTOR       = 0.5   # factor de velocidad para Give
-TURN_ANGLE            = math.pi / 2.0   # 90 grados
-TURN_OMEGA            = 0.28            # rad/s durante giro
-TURN_ANGLE_TOL        = 0.08            # tolerancia angular ~4.6°
-STRAIGHT_OVERRIDE_FRAMES = 30           # frames de avance recto en AOnly
+INTERSECTION_MIN_COLS    = 6
+STOP_SIGN_DURATION       = 3.0
+STOP_SIGN_COOLDOWN       = 10.0
+CROSSING_VEL_FACTOR      = 0.5
+GIVE_VEL_FACTOR          = 0.5
+TURN_ANGLE               = math.pi / 2.0
+TURN_OMEGA               = 0.28
+TURN_ANGLE_TOL           = 0.08
+STRAIGHT_OVERRIDE_FRAMES = 30
 
 # ─────────────────────────────────────────────────────────────────────────────
 # EVIDENCIA
 # ─────────────────────────────────────────────────────────────────────────────
-# Usar /tmp es seguro en Docker independientemente del usuario (root o ubuntu).
-# ~/puzzlebot_evidence puede fallar si HOME no está configurado en el entorno ROS.
-_HOME          = os.environ.get('HOME', '/tmp')
-EVIDENCE_DIR   = os.path.join(_HOME, 'puzzlebot_evidence', 'line_follower')
-FRAMES_DIR     = os.path.join(EVIDENCE_DIR, 'frames')
-MASKS_DIR      = os.path.join(EVIDENCE_DIR, 'masks')
-EVIDENCE_INTERVAL_S = 5.0
-MAX_EVIDENCE   = 5
+_HOME               = os.environ.get('HOME', '/tmp')
+FRAMES_DIR          = os.path.join(_HOME, 'puzzlebot_evidence', 'line_follower', 'frames')
+EVIDENCE_INTERVAL_S = 5.0      # una foto cada N segundos
+MAX_EVIDENCE_TOTAL  = 10       # máximo de fotos almacenadas
+# Cuando se supera MAX_EVIDENCE_TOTAL se eliminan las más nuevas (mayor timestamp),
+# conservando las primeras fotos tomadas (menor timestamp).
 
-# Crear directorios en el momento de importar el módulo para detectar errores rápido
 try:
     os.makedirs(FRAMES_DIR, exist_ok=True)
-    os.makedirs(MASKS_DIR,  exist_ok=True)
 except OSError as _e:
     import warnings
     warnings.warn(f'[line_follower] No se pudo crear directorio de evidencia: {_e}')
 
 
-def _save_evidence_pair(frame: np.ndarray, mask: np.ndarray) -> None:
+def _save_frame(frame: np.ndarray) -> None:
+    """
+    Guarda una foto. Si hay más de MAX_EVIDENCE_TOTAL archivos elimina los
+    más recientes (mayor timestamp en el nombre), conservando los más antiguos.
+    """
     try:
-        ts      = int(time.time() * 1000)
-        f_path  = os.path.join(FRAMES_DIR, f'frame_{ts}.jpg')
-        m_path  = os.path.join(MASKS_DIR,  f'mask_{ts}.jpg')
-        ok_f    = cv2.imwrite(f_path, frame)
-        ok_m    = cv2.imwrite(m_path, mask)
-        if not ok_f or not ok_m:
+        ts   = int(time.time() * 1000)
+        path = os.path.join(FRAMES_DIR, f'frame_{ts}.jpg')
+        ok   = cv2.imwrite(path, frame)
+        if not ok:
             import sys
-            print(f'[evidencia] cv2.imwrite falló: frame={ok_f} mask={ok_m} '
-                  f'dirs={FRAMES_DIR}', file=sys.stderr)
-        _rotate(FRAMES_DIR, '*.jpg')
-        _rotate(MASKS_DIR,  '*.jpg')
+            print(f'[evidencia] cv2.imwrite falló: {path}', file=sys.stderr)
+            return
+
+        # sorted() con nombres frame_TIMESTAMP.jpg ordena de menor a mayor timestamp
+        # → files[0] = más antiguo, files[-1] = más reciente
+        files = sorted(glob.glob(os.path.join(FRAMES_DIR, 'frame_*.jpg')))
+        while len(files) > MAX_EVIDENCE_TOTAL:
+            # Eliminar el MÁS RECIENTE (pop desde el final)
+            os.remove(files.pop())
+
     except Exception as exc:
         import sys
-        print(f'[evidencia] excepción al guardar: {exc}', file=sys.stderr)
-
-
-def _rotate(directory: str, pattern: str) -> None:
-    files = sorted(glob.glob(os.path.join(directory, pattern)))
-    while len(files) > MAX_EVIDENCE:
-        os.remove(files.pop(0))
+        print(f'[evidencia] excepción: {exc}', file=sys.stderr)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -158,7 +145,6 @@ def yaw_from_quaternion(q) -> float:
 
 
 def angle_diff(target: float, current: float) -> float:
-    """Diferencia angular con wrapping a [-π, π]."""
     d = target - current
     while d >  math.pi: d -= 2 * math.pi
     while d < -math.pi: d += 2 * math.pi
@@ -171,10 +157,10 @@ def angle_diff(target: float, current: float) -> float:
 
 class RobotState(Enum):
     FOLLOWING         = 'following'
-    STOPPED_LIGHT     = 'stopped_light'    # semáforo rojo
-    STOPPED_SIGN      = 'stopped_sign'     # señal STOP
-    TURNING           = 'turning'          # giro en intersección
-    STRAIGHT_OVERRIDE = 'straight_override'  # AOnly en intersección
+    STOPPED_LIGHT     = 'stopped_light'
+    STOPPED_SIGN      = 'stopped_sign'
+    TURNING           = 'turning'
+    STRAIGHT_OVERRIDE = 'straight_override'
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -183,10 +169,8 @@ class RobotState(Enum):
 
 class GridLineDetector:
 
-    def __init__(self, n_cols: int = N_COLS,
-                 roi_frac: float = ROI_FRACTION,
-                 roi_left: float = ROI_LEFT,
-                 roi_right: float = ROI_RIGHT):
+    def __init__(self, n_cols=N_COLS, roi_frac=ROI_FRACTION,
+                 roi_left=ROI_LEFT, roi_right=ROI_RIGHT):
         self.n_cols    = n_cols
         self.roi_frac  = roi_frac
         self.roi_left  = roi_left
@@ -194,8 +178,7 @@ class GridLineDetector:
 
     def process(self, frame: np.ndarray):
         """
-        Retorna (error_norm, found, debug_frame, densities, mask_full, at_intersection).
-        mask_full: máscara binaria del tamaño del frame original (para evidencia).
+        Retorna (error_norm, found, debug_frame, densities, at_intersection).
         at_intersection: True si ≥ INTERSECTION_MIN_COLS columnas activas.
         """
         h, w = frame.shape[:2]
@@ -211,10 +194,6 @@ class GridLineDetector:
         blurred = cv2.GaussianBlur(gray, (BLUR_K, BLUR_K), 0)
         _, mask = cv2.threshold(blurred, THRESH_VAL, 255, cv2.THRESH_BINARY_INV)
 
-        # Máscara tamaño completo para evidencia
-        mask_full = np.zeros((h, w), dtype=np.uint8)
-        mask_full[roi_y0:h, x0_roi:x1_roi] = mask
-
         col_w     = roi_w / self.n_cols
         densities = np.zeros(self.n_cols, dtype=np.float32)
         cell_pxls = roi_h * col_w
@@ -226,7 +205,6 @@ class GridLineDetector:
 
         found  = densities.max() > MIN_CELL_FILL
         active = densities > MIN_CELL_FILL
-
         at_intersection = int(active.sum()) >= INTERSECTION_MIN_COLS
 
         if found and active.sum() > 0:
@@ -238,7 +216,7 @@ class GridLineDetector:
 
         error_norm = (roi_w / 2.0 - weighted_cx) / (roi_w / 2.0)
 
-        # ── Frame de depuración ─────────────────────────────────────────
+        # ── Debug frame ────────────────────────────────────────────────────
         debug = frame.copy()
 
         overlay = debug.copy()
@@ -254,14 +232,12 @@ class GridLineDetector:
             cx0  = x0_roi + int(i * col_w)
             cx1  = x0_roi + int((i + 1) * col_w)
             dens = densities[i]
-
             if dens > MIN_CELL_FILL:
                 intensity    = int(clamp(dens * 3.0, 0.0, 1.0) * 255)
                 cell_overlay = debug.copy()
                 cv2.rectangle(cell_overlay, (cx0, roi_y0), (cx1, h),
                               (0, intensity, 0), -1)
                 cv2.addWeighted(cell_overlay, 0.4, debug, 0.6, 0, debug)
-
             cv2.rectangle(debug, (cx0, roi_y0), (cx1, h), (80, 80, 80), 1)
             cv2.putText(debug, f'{dens:.2f}', (cx0 + 3, roi_y0 + 14),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.32,
@@ -269,7 +245,6 @@ class GridLineDetector:
 
         cx_frame  = x0_roi + int(weighted_cx)
         cx_center = (x0_roi + x1_roi) // 2
-
         if found:
             cv2.line(debug, (cx_frame, roi_y0), (cx_frame, h), (0, 0, 255), 2)
         cv2.line(debug, (cx_center, roi_y0), (cx_center, h), (255, 0, 0), 1)
@@ -278,16 +253,12 @@ class GridLineDetector:
         cv2.arrowedLine(debug, (cx_center, arrow_y), (cx_frame, arrow_y),
                         (0, 255, 255) if found else (0, 0, 100), 2, tipLength=0.3)
 
-        if at_intersection:
-            cv2.putText(debug, 'INTERSECCION', (x0_roi + 4, roi_y0 - 22),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 165, 255), 2)
-
         state_txt = f'err={error_norm:+.3f}' if found else 'NO LINE'
         state_col = (0, 255, 100) if found else (0, 50, 255)
         cv2.putText(debug, state_txt, (x0_roi + 4, roi_y0 - 6),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.55, state_col, 2)
 
-        return error_norm, found, debug, densities, mask_full, at_intersection
+        return error_norm, found, debug, densities, at_intersection
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -310,34 +281,30 @@ class LineFollowerCV(Node):
 
         # ── Estado PD ─────────────────────────────────────────────────────
         self._prev_error     = 0.0
-        self._filtered_error = 0.0   # error suavizado (filtro exponencial)
+        self._filtered_error = 0.0
         self._prev_time      = None
         self._last_error     = 0.0
         self._frames_lost    = 0
-
-        # ── Semáforo ───────────────────────────────────────────────────────
-        self._semaforo = 'ninguno'
 
         # ── Odometría ─────────────────────────────────────────────────────
         self._current_yaw = 0.0
         self._odom_ready  = False
 
-        # ── Máquina de estados ─────────────────────────────────────────────
-        self._state         = RobotState.FOLLOWING
-        self._state_timer   = 0.0    # timestamp cuando el estado comenzó
-        self._turn_dir      = 0.0    # +1 = izquierda, -1 = derecha
-        self._turn_start_yaw = 0.0
-        self._straight_frames = 0
+        # ── Semáforo (inactivo si SEMAFORO_ENABLED = False) ───────────────
+        self._semaforo = 'ninguno'
 
-        # ── Estado de señales ─────────────────────────────────────────────
+        # ── Señales (inactivo si SIGNS_ENABLED = False) ───────────────────
+        self._state              = RobotState.FOLLOWING
+        self._state_timer        = 0.0
+        self._turn_dir           = 0.0
+        self._turn_start_yaw     = 0.0
+        self._straight_frames    = 0
         self._current_sign       = 'ninguna'
-        self._pending_turn       = None   # 'right', 'left', o None
-        self._pending_straight   = False  # AOnly
+        self._pending_turn       = None
+        self._pending_straight   = False
         self._give_active        = False
         self._crossing_visible   = False
-        self._stop_cooldown_until = 0.0   # timestamp hasta el que STOP está bloqueado
-
-        # ── Intersección ──────────────────────────────────────────────────
+        self._stop_cooldown_until = 0.0
         self._was_at_intersection = False
 
         # ── Evidencia ─────────────────────────────────────────────────────
@@ -348,19 +315,34 @@ class LineFollowerCV(Node):
         self._pub_dbg = self.create_publisher(Image,   '/vision/debug_img', 10)
         self._pub_err = self.create_publisher(Float32, '/vision/error',     10)
 
-        # ── Subscribers ───────────────────────────────────────────────────
-        self.create_subscription(Image,    '/image/raw',       self._image_cb,    qos_be)
-        self.create_subscription(Odometry, '/odom',            self._odom_cb,     qos_be)
-        self.create_subscription(String,   '/semaforo/estado', self._semaforo_cb, 10)
-        self.create_subscription(String,   '/sign/state',      self._sign_cb,     10)
+        # ── Subscribers siempre activos ───────────────────────────────────
+        self.create_subscription(Image,    '/image/raw', self._image_cb, qos_be)
+        self.create_subscription(Odometry, '/odom',      self._odom_cb,  qos_be)
+
+        # ── Subscribers opcionales ────────────────────────────────────────
+        if SEMAFORO_ENABLED:
+            self.create_subscription(String, '/semaforo/estado',
+                                     self._semaforo_cb, 10)
+            self.get_logger().info('Semáforo: ACTIVO')
+        else:
+            self.get_logger().info('Semáforo: DESHABILITADO (SEMAFORO_ENABLED=False)')
+
+        if SIGNS_ENABLED:
+            self.create_subscription(String, '/sign/state',
+                                     self._sign_cb, 10)
+            self.get_logger().info('Señales: ACTIVO')
+        else:
+            self.get_logger().info('Señales: DESHABILITADO (SIGNS_ENABLED=False)')
 
         self.get_logger().info(
             f'LineFollowerCV listo\n'
-            f'  KP={KP_VIS}  KD={KD_VIS}  v={LINEAR_VEL} m/s\n'
+            f'  KP={KP_VIS}  KD={KD_VIS}  alpha={ERROR_ALPHA}  v={LINEAR_VEL} m/s\n'
             f'  ROI inferior={int(ROI_FRACTION*100)}% | '
             f'zona activa={int((ROI_RIGHT-ROI_LEFT)*100)}% central | '
             f'{N_COLS} columnas\n'
-            f'  Detección intersección ≥{INTERSECTION_MIN_COLS} cols activas'
+            f'  Evidencia: {FRAMES_DIR}\n'
+            f'  (foto cada {EVIDENCE_INTERVAL_S}s, máx {MAX_EVIDENCE_TOTAL}, '
+            f'se conservan las primeras)'
         )
 
     # ── Callbacks de sensores ────────────────────────────────────────────────
@@ -380,12 +362,10 @@ class LineFollowerCV(Node):
         if sign != self._current_sign:
             self.get_logger().info(f'Señal: {self._current_sign} → {sign}')
 
-        self._current_sign    = sign
+        self._current_sign     = sign
         self._crossing_visible = (sign == 'Crossing')
-
         now = time.time()
 
-        # STOP: registrar orden solo si no está en cooldown y estamos en FOLLOWING
         if (sign == 'STOP'
                 and self._state == RobotState.FOLLOWING
                 and now >= self._stop_cooldown_until):
@@ -393,24 +373,16 @@ class LineFollowerCV(Node):
             self._state_timer = now
             self._stop_cooldown_until = now + STOP_SIGN_DURATION + STOP_SIGN_COOLDOWN
             self.get_logger().info('STOP: deteniendo robot 3 s')
-
-        # Giros: registrar pendiente (se ejecutan en la próxima intersección)
         elif sign == 'TurnR' and self._pending_turn is None:
             self._pending_turn = 'right'
-            self.get_logger().info('TurnR: pendiente en próxima intersección')
-
         elif sign == 'TurnL' and self._pending_turn is None:
             self._pending_turn = 'left'
-            self.get_logger().info('TurnL: pendiente en próxima intersección')
-
         elif sign == 'AOnly' and not self._pending_straight:
             self._pending_straight = True
-            self.get_logger().info('AOnly: recto en próxima intersección')
-
         elif sign == 'Give':
             self._give_active = True
 
-    # ── Callback de imagen principal ─────────────────────────────────────────
+    # ── Callback de imagen ───────────────────────────────────────────────────
 
     def _image_cb(self, msg: Image):
         try:
@@ -419,27 +391,25 @@ class LineFollowerCV(Node):
             self.get_logger().warn(f'cv_bridge error: {e}')
             return
 
-        result = self._detector.process(frame)
-        error_norm, found, debug_frame, densities, mask_full, at_intersection = result
+        error_norm, found, debug_frame, densities, at_intersection = \
+            self._detector.process(frame)
 
-        # Evidencia periódica
+        # ── Evidencia ────────────────────────────────────────────────────
         now = time.time()
         if now - self._last_evidence_time >= EVIDENCE_INTERVAL_S:
-            _save_evidence_pair(frame, mask_full)
+            _save_frame(frame)
             self._last_evidence_time = now
 
-        # Detectar FLANCO de entrada a intersección
-        entered_intersection = at_intersection and not self._was_at_intersection
-        self._was_at_intersection = at_intersection
+        # ── Intersección (solo si señales activas) ────────────────────────
+        if SIGNS_ENABLED:
+            entered = at_intersection and not self._was_at_intersection
+            self._was_at_intersection = at_intersection
+            if entered:
+                self._on_intersection_enter()
+            if self._give_active and not at_intersection and self._was_at_intersection:
+                self._give_active = False
 
-        if entered_intersection:
-            self._on_intersection_enter()
-
-        # Si Give activo y salimos de intersección, limpiar
-        if self._give_active and not at_intersection and self._was_at_intersection:
-            self._give_active = False
-            self.get_logger().info('Give: velocidad normal restaurada')
-
+        # ── Publicar debug y error ────────────────────────────────────────
         dbg_msg        = self._bridge.cv2_to_imgmsg(debug_frame, encoding='bgr8')
         dbg_msg.header = msg.header
         self._pub_dbg.publish(dbg_msg)
@@ -450,35 +420,25 @@ class LineFollowerCV(Node):
 
         self._run_control(error_norm, found)
 
-    # ── Manejo de intersecciones ─────────────────────────────────────────────
+    # ── Intersecciones ───────────────────────────────────────────────────────
 
     def _on_intersection_enter(self):
         if self._state != RobotState.FOLLOWING:
-            return  # no actuar si ya estamos en otro estado
-
+            return
         if self._pending_turn == 'right':
-            self.get_logger().info('Intersección: giro DERECHA')
             self._start_turn(-1.0)
             self._pending_turn = None
-
         elif self._pending_turn == 'left':
-            self.get_logger().info('Intersección: giro IZQUIERDA')
             self._start_turn(1.0)
             self._pending_turn = None
-
         elif self._pending_straight:
-            self.get_logger().info('Intersección: AOnly - avance recto')
             self._state           = RobotState.STRAIGHT_OVERRIDE
             self._straight_frames = 0
             self._pending_straight = False
-
-        # Give: limpiar al cruzar la intersección
         if self._give_active:
             self._give_active = False
-            self.get_logger().info('Give: cruce completado, velocidad normal')
 
     def _start_turn(self, direction: float):
-        """direction: +1 = izquierda, -1 = derecha."""
         if not self._odom_ready:
             self.get_logger().warn('Odometría no disponible, saltando giro')
             return
@@ -490,64 +450,62 @@ class LineFollowerCV(Node):
 
     def _run_control(self, error_norm: float, found: bool):
         now = time.time()
-        cmd = Twist()
 
-        # ── Semáforo rojo (máxima prioridad) ──────────────────────────────
-        if self._semaforo == 'rojo':
+        # Semáforo rojo (máxima prioridad, solo si activo)
+        if SEMAFORO_ENABLED and self._semaforo == 'rojo':
             if self._state != RobotState.STOPPED_LIGHT:
                 self._state = RobotState.STOPPED_LIGHT
             self._pub_cmd.publish(Twist())
             return
-
-        # Si estábamos parados por luz roja y ya no hay rojo, retomar
         if self._state == RobotState.STOPPED_LIGHT:
             self._state = RobotState.FOLLOWING
 
-        # ── STOP sign ─────────────────────────────────────────────────────
+        # STOP sign
         if self._state == RobotState.STOPPED_SIGN:
             if now - self._state_timer >= STOP_SIGN_DURATION:
-                self.get_logger().info('STOP: reanudando seguimiento de línea')
                 self._state = RobotState.FOLLOWING
             else:
                 self._pub_cmd.publish(Twist())
                 return
 
-        # ── Giro en intersección ───────────────────────────────────────────
+        # Giro
         if self._state == RobotState.TURNING:
             target_yaw = self._turn_start_yaw + self._turn_dir * TURN_ANGLE
             diff       = angle_diff(target_yaw, self._current_yaw)
-
             if abs(diff) <= TURN_ANGLE_TOL:
-                self.get_logger().info('Giro completado')
                 self._state = RobotState.FOLLOWING
             else:
-                cmd.linear.x  = 0.05   # avance lento durante el giro
+                cmd = Twist()
+                cmd.linear.x  = 0.05
                 cmd.angular.z = self._turn_dir * TURN_OMEGA
                 self._pub_cmd.publish(cmd)
             return
 
-        # ── AOnly recto en intersección ───────────────────────────────────
+        # AOnly
         if self._state == RobotState.STRAIGHT_OVERRIDE:
             self._straight_frames += 1
             if self._straight_frames >= STRAIGHT_OVERRIDE_FRAMES:
                 self._state = RobotState.FOLLOWING
             else:
+                cmd = Twist()
                 cmd.linear.x  = LINEAR_VEL
                 cmd.angular.z = 0.0
                 self._pub_cmd.publish(cmd)
             return
 
-        # ── Seguimiento normal (FOLLOWING) ────────────────────────────────
         # Factor de velocidad por señales activas
         vel_factor = 1.0
-        if self._semaforo == 'amarillo':
+        if SEMAFORO_ENABLED and self._semaforo == 'amarillo':
             vel_factor = 0.5
-        elif self._crossing_visible:
-            vel_factor = CROSSING_VEL_FACTOR
-        elif self._give_active:
-            vel_factor = GIVE_VEL_FACTOR
+        if SIGNS_ENABLED:
+            if self._crossing_visible:
+                vel_factor = CROSSING_VEL_FACTOR
+            elif self._give_active:
+                vel_factor = GIVE_VEL_FACTOR
 
         self._run_pd(error_norm, found, vel_factor)
+
+    # ── Controlador PD con filtro exponencial ────────────────────────────────
 
     def _run_pd(self, error_norm: float, found: bool, vel_factor: float):
         now = self.get_clock().now().nanoseconds * 1e-9
@@ -560,8 +518,6 @@ class LineFollowerCV(Node):
             self._frames_lost = 0
             self._last_error  = error_norm
 
-            # Filtro exponencial: suaviza el error para eliminar latigazos
-            # error_filtrado = alpha * error_anterior + (1-alpha) * error_nuevo
             self._filtered_error = (ERROR_ALPHA * self._filtered_error +
                                     (1.0 - ERROR_ALPHA) * error_norm)
 
@@ -573,8 +529,7 @@ class LineFollowerCV(Node):
             cmd.angular.z = u
 
         else:
-            self._frames_lost += 1
-            # Al perder la línea, decaer el error filtrado hacia cero gradualmente
+            self._frames_lost    += 1
             self._filtered_error *= 0.85
 
             if self._frames_lost < RECOVERY_FRAMES:
@@ -583,8 +538,7 @@ class LineFollowerCV(Node):
                 cmd.angular.z = clamp(u, -MAX_ANGULAR, MAX_ANGULAR)
             else:
                 self.get_logger().warn(
-                    f'Línea perdida {self._frames_lost} frames — buscando'
-                )
+                    f'Línea perdida {self._frames_lost} frames — buscando')
                 cmd.linear.x  = 0.0
                 sign          = 1.0 if self._last_error >= 0 else -1.0
                 cmd.angular.z = sign * RECOVERY_OMEGA

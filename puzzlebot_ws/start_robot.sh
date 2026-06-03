@@ -11,7 +11,6 @@
 
 set -e
 
-# ── Colores para logs ─────────────────────────────────────────────────────────
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 RED='\033[0;31m'
@@ -19,7 +18,6 @@ NC='\033[0m'
 
 log()  { echo -e "${GREEN}[$(date +%H:%M:%S)] $1${NC}"; }
 warn() { echo -e "${YELLOW}[$(date +%H:%M:%S)] $1${NC}"; }
-die()  { echo -e "${RED}[$(date +%H:%M:%S)] ERROR: $1${NC}"; exit 1; }
 
 # ── Sources ───────────────────────────────────────────────────────────────────
 log "Sourcing ROS Jazzy..."
@@ -64,7 +62,7 @@ launch() {
 launch "micro_ros_agent" \
     ros2 run micro_ros_agent micro_ros_agent serial --dev /dev/ttyUSB0 -b 115200
 
-# 2. Odometría (necesita que el agent esté listo y el robot conectado)
+# 2. Odometría
 launch "odometry" \
     ros2 run straight_line odometry
 
@@ -72,15 +70,7 @@ launch "odometry" \
 launch "camera_node" \
     ros2 run straight_line camera_node
 
-# 4. Semáforo (necesita /image/raw)
-launch "semaforo" \
-    ros2 run straight_line semaforo
-
-# 5. Detector de señales (necesita /image/raw)
-launch "sign_detector" \
-    ros2 run straight_line sign_detector
-
-# 6. Seguidor de línea (necesita todo lo anterior)
+# 4. Seguidor de línea
 launch "line_follower_cv" \
     ros2 run straight_line line_follower_cv
 
@@ -88,11 +78,7 @@ launch "line_follower_cv" \
 log "Todos los nodos activos. Ctrl+C para detener."
 log "PIDs: ${PIDS[*]}"
 echo ""
-warn "Topics de video (navegador en la misma red):"
-warn "  http://$(hostname -I | awk '{print $1}'):8080/stream?topic=/vision/debug_img&quality=60"
-warn "  http://$(hostname -I | awk '{print $1}'):8080/stream?topic=/semaforo/debug_img&quality=60"
-warn "  http://$(hostname -I | awk '{print $1}'):8080/stream?topic=/sign/debug_img&quality=60"
-echo ""
+warn "Fotos guardándose en: $HOME/puzzlebot_evidence/line_follower/frames/"
 
 # Esperar indefinidamente hasta Ctrl+C
 wait
