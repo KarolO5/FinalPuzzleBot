@@ -59,12 +59,18 @@ from rclpy.qos          import QoSProfile, QoSReliabilityPolicy, QoSHistoryPolic
 WHEEL_RADIUS = 0.0525
 WHEEL_BASE   = 0.164
 MAX_LINEAR   = 0.20
-MAX_ANGULAR  = 0.35
-LINEAR_VEL   = 0.15
+MAX_ANGULAR  = 0.30   # reducido de 0.35 para limitar latigazos
+LINEAR_VEL   = 0.13   # reducido de 0.15: menos velocidad → más tiempo para corregir
 
 # PD visual
-KP_VIS = 1.8
-KD_VIS = 0.25
+# KP bajo: menos reacción brusca ante error instantáneo
+# KD alto: amortigua oscilaciones
+KP_VIS = 1.2   # era 1.8 — reducido para suavizar respuesta
+KD_VIS = 0.45  # era 0.25 — aumentado para más amortiguamiento
+
+# Suavizado exponencial del error antes del PD  (0 = sin suavizado, 1 = congelar)
+# Reduce el ruido frame-a-frame que causa los latigazos de alta frecuencia
+ERROR_ALPHA = 0.4   # mezcla: error_filtrado = alpha*error_anterior + (1-alpha)*error_nuevo
 
 # Visión — ROI
 ROI_FRACTION  = 0.40
@@ -95,21 +101,40 @@ STRAIGHT_OVERRIDE_FRAMES = 30           # frames de avance recto en AOnly
 # ─────────────────────────────────────────────────────────────────────────────
 # EVIDENCIA
 # ─────────────────────────────────────────────────────────────────────────────
-EVIDENCE_DIR         = os.path.expanduser('~/puzzlebot_evidence/line_follower')
-FRAMES_DIR           = os.path.join(EVIDENCE_DIR, 'frames')
-MASKS_DIR            = os.path.join(EVIDENCE_DIR, 'masks')
-EVIDENCE_INTERVAL_S  = 5.0
-MAX_EVIDENCE         = 5
+# Usar /tmp es seguro en Docker independientemente del usuario (root o ubuntu).
+# ~/puzzlebot_evidence puede fallar si HOME no está configurado en el entorno ROS.
+_HOME          = os.environ.get('HOME', '/tmp')
+EVIDENCE_DIR   = os.path.join(_HOME, 'puzzlebot_evidence', 'line_follower')
+FRAMES_DIR     = os.path.join(EVIDENCE_DIR, 'frames')
+MASKS_DIR      = os.path.join(EVIDENCE_DIR, 'masks')
+EVIDENCE_INTERVAL_S = 5.0
+MAX_EVIDENCE   = 5
+
+# Crear directorios en el momento de importar el módulo para detectar errores rápido
+try:
+    os.makedirs(FRAMES_DIR, exist_ok=True)
+    os.makedirs(MASKS_DIR,  exist_ok=True)
+except OSError as _e:
+    import warnings
+    warnings.warn(f'[line_follower] No se pudo crear directorio de evidencia: {_e}')
 
 
 def _save_evidence_pair(frame: np.ndarray, mask: np.ndarray) -> None:
-    os.makedirs(FRAMES_DIR, exist_ok=True)
-    os.makedirs(MASKS_DIR,  exist_ok=True)
-    ts = int(time.time() * 1000)
-    cv2.imwrite(os.path.join(FRAMES_DIR, f'frame_{ts}.jpg'), frame)
-    cv2.imwrite(os.path.join(MASKS_DIR,  f'mask_{ts}.jpg'),  mask)
-    _rotate(FRAMES_DIR, '*.jpg')
-    _rotate(MASKS_DIR,  '*.jpg')
+    try:
+        ts      = int(time.time() * 1000)
+        f_path  = os.path.join(FRAMES_DIR, f'frame_{ts}.jpg')
+        m_path  = os.path.join(MASKS_DIR,  f'mask_{ts}.jpg')
+        ok_f    = cv2.imwrite(f_path, frame)
+        ok_m    = cv2.imwrite(m_path, mask)
+        if not ok_f or not ok_m:
+            import sys
+            print(f'[evidencia] cv2.imwrite falló: frame={ok_f} mask={ok_m} '
+                  f'dirs={FRAMES_DIR}', file=sys.stderr)
+        _rotate(FRAMES_DIR, '*.jpg')
+        _rotate(MASKS_DIR,  '*.jpg')
+    except Exception as exc:
+        import sys
+        print(f'[evidencia] excepción al guardar: {exc}', file=sys.stderr)
 
 
 def _rotate(directory: str, pattern: str) -> None:
@@ -284,10 +309,11 @@ class LineFollowerCV(Node):
         self._bridge   = CvBridge()
 
         # ── Estado PD ─────────────────────────────────────────────────────
-        self._prev_error  = 0.0
-        self._prev_time   = None
-        self._last_error  = 0.0
-        self._frames_lost = 0
+        self._prev_error     = 0.0
+        self._filtered_error = 0.0   # error suavizado (filtro exponencial)
+        self._prev_time      = None
+        self._last_error     = 0.0
+        self._frames_lost    = 0
 
         # ── Semáforo ───────────────────────────────────────────────────────
         self._semaforo = 'ninguno'
@@ -534,8 +560,13 @@ class LineFollowerCV(Node):
             self._frames_lost = 0
             self._last_error  = error_norm
 
-            d_error = (error_norm - self._prev_error) / dt
-            u       = KP_VIS * error_norm + KD_VIS * d_error
+            # Filtro exponencial: suaviza el error para eliminar latigazos
+            # error_filtrado = alpha * error_anterior + (1-alpha) * error_nuevo
+            self._filtered_error = (ERROR_ALPHA * self._filtered_error +
+                                    (1.0 - ERROR_ALPHA) * error_norm)
+
+            d_error = (self._filtered_error - self._prev_error) / dt
+            u       = KP_VIS * self._filtered_error + KD_VIS * d_error
             u       = clamp(u, -MAX_ANGULAR, MAX_ANGULAR)
 
             cmd.linear.x  = LINEAR_VEL * vel_factor
@@ -543,6 +574,8 @@ class LineFollowerCV(Node):
 
         else:
             self._frames_lost += 1
+            # Al perder la línea, decaer el error filtrado hacia cero gradualmente
+            self._filtered_error *= 0.85
 
             if self._frames_lost < RECOVERY_FRAMES:
                 u             = KP_VIS * self._last_error * 0.5
@@ -556,7 +589,7 @@ class LineFollowerCV(Node):
                 sign          = 1.0 if self._last_error >= 0 else -1.0
                 cmd.angular.z = sign * RECOVERY_OMEGA
 
-        self._prev_error = error_norm if found else self._prev_error
+        self._prev_error = self._filtered_error if found else self._prev_error
         self._prev_time  = now
 
         self._pub_cmd.publish(cmd)

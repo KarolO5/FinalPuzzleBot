@@ -100,7 +100,14 @@ INFER_HZ         = 5      # Hz máximos de inferencia
 
 # Evidencia
 MAX_EVIDENCE  = 5
-EVIDENCE_DIR  = os.path.expanduser('~/puzzlebot_evidence/signs')
+_HOME         = os.environ.get('HOME', '/tmp')
+EVIDENCE_DIR  = os.path.join(_HOME, 'puzzlebot_evidence', 'signs')
+
+try:
+    os.makedirs(EVIDENCE_DIR, exist_ok=True)
+except OSError as _e:
+    import warnings
+    warnings.warn(f'[sign_detector] No se pudo crear directorio de evidencia: {_e}')
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -108,11 +115,16 @@ EVIDENCE_DIR  = os.path.expanduser('~/puzzlebot_evidence/signs')
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _save_evidence(frame: np.ndarray, tag: str) -> None:
-    os.makedirs(EVIDENCE_DIR, exist_ok=True)
-    ts   = int(time.time() * 1000)
-    path = os.path.join(EVIDENCE_DIR, f'{tag}_{ts}.jpg')
-    cv2.imwrite(path, frame)
-    _rotate(EVIDENCE_DIR, '*.jpg')
+    try:
+        ts   = int(time.time() * 1000)
+        path = os.path.join(EVIDENCE_DIR, f'{tag}_{ts}.jpg')
+        if not cv2.imwrite(path, frame):
+            import sys
+            print(f'[sign evidencia] cv2.imwrite falló: {path}', file=sys.stderr)
+        _rotate(EVIDENCE_DIR, '*.jpg')
+    except Exception as exc:
+        import sys
+        print(f'[sign evidencia] excepción: {exc}', file=sys.stderr)
 
 
 def _rotate(directory: str, pattern: str) -> None:

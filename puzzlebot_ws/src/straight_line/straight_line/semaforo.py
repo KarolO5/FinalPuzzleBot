@@ -64,17 +64,29 @@ MIN_PIXELS = 150
 # EVIDENCIA
 # ─────────────────────────────────────────────────────────────────────────────
 MAX_EVIDENCE    = 5
-EVIDENCE_DIR    = os.path.expanduser('~/puzzlebot_evidence/semaforo')
+_HOME           = os.environ.get('HOME', '/tmp')
+EVIDENCE_DIR    = os.path.join(_HOME, 'puzzlebot_evidence', 'semaforo')
+
+try:
+    os.makedirs(EVIDENCE_DIR, exist_ok=True)
+except OSError as _e:
+    import warnings
+    warnings.warn(f'[semaforo] No se pudo crear directorio de evidencia: {_e}')
 
 
 def _save_evidence(frame: np.ndarray, tag: str) -> None:
     """Guarda una imagen de detección; mantiene solo MAX_EVIDENCE archivos."""
-    os.makedirs(EVIDENCE_DIR, exist_ok=True)
     import time
-    ts   = int(time.time() * 1000)
-    path = os.path.join(EVIDENCE_DIR, f'{tag}_{ts}.jpg')
-    cv2.imwrite(path, frame)
-    _rotate_evidence(EVIDENCE_DIR, '*.jpg')
+    try:
+        ts   = int(time.time() * 1000)
+        path = os.path.join(EVIDENCE_DIR, f'{tag}_{ts}.jpg')
+        if not cv2.imwrite(path, frame):
+            import sys
+            print(f'[semaforo evidencia] cv2.imwrite falló: {path}', file=sys.stderr)
+        _rotate_evidence(EVIDENCE_DIR, '*.jpg')
+    except Exception as exc:
+        import sys
+        print(f'[semaforo evidencia] excepción: {exc}', file=sys.stderr)
 
 
 def _rotate_evidence(directory: str, pattern: str) -> None:
