@@ -64,9 +64,23 @@ except ImportError:
 # CONFIGURACIÓN
 # ─────────────────────────────────────────────────────────────────────────────
 
-# Ruta al modelo — relativa al workspace o absoluta
-_WS_DIR    = os.path.join(os.path.dirname(__file__), '..', '..', '..', '..', 'models')
-MODEL_PATH = os.path.normpath(os.path.join(_WS_DIR, 'best_copy.onnx'))
+# Ruta al modelo.
+# Búsqueda en orden:
+#   1. Variable de entorno PUZZLEBOT_MODEL_PATH  (mayor prioridad)
+#   2. Ruta canónica del workspace del robot en el Docker
+#   3. Ruta del repositorio en la Mac de desarrollo
+# También puede sobreescribirse en tiempo de ejecución con el parámetro ROS
+# 'model_path':  ros2 run straight_line sign_detector --ros-args -p model_path:=/ruta/al/best_copy.onnx
+_CANDIDATE_PATHS = [
+    os.environ.get('PUZZLEBOT_MODEL_PATH', ''),
+    '/home/ubuntu/puzzlebot_docker/puzzlebot_ws/models/best_copy.onnx',
+    os.path.expanduser('~/puzzlebot_docker/puzzlebot_ws/models/best_copy.onnx'),
+    os.path.expanduser('~/puzzlebot_ws/models/best_copy.onnx'),
+]
+MODEL_PATH = next(
+    (p for p in _CANDIDATE_PATHS if p and os.path.exists(p)),
+    '/home/ubuntu/puzzlebot_docker/puzzlebot_ws/models/best_copy.onnx'  # fallback (mostrará error claro)
+)
 
 # Clases en el orden en que fueron entrenadas en el modelo
 CLASS_NAMES = ['STOP', 'Crossing', 'Give', 'TurnR', 'TurnL', 'AOnly']
@@ -270,6 +284,11 @@ class SignDetectorNode(Node):
 
         self.create_subscription(Image, '/image/raw', self._image_cb, qos_be)
 
+        # Parámetro ROS para sobreescribir la ruta del modelo en tiempo de ejecución:
+        #   ros2 run straight_line sign_detector --ros-args -p model_path:=/ruta/modelo.onnx
+        self.declare_parameter('model_path', MODEL_PATH)
+        model_path = self.get_parameter('model_path').get_parameter_value().string_value
+
         if not _ONNX_AVAILABLE:
             self.get_logger().error(
                 'onnxruntime no está instalado. '
@@ -278,19 +297,25 @@ class SignDetectorNode(Node):
             )
             return
 
-        if not os.path.exists(MODEL_PATH):
-            self.get_logger().error(f'Modelo no encontrado: {MODEL_PATH}')
+        if not os.path.exists(model_path):
+            self.get_logger().error(
+                f'Modelo no encontrado: {model_path}\n'
+                f'  Rutas buscadas automáticamente:\n'
+                + '\n'.join(f'    {p}' for p in _CANDIDATE_PATHS if p) +
+                f'\n  Solución: ros2 run straight_line sign_detector '
+                f'--ros-args -p model_path:=/ruta/absoluta/best_copy.onnx'
+            )
             return
 
         try:
             self._detector = YOLODetector(
-                MODEL_PATH,
+                model_path,
                 input_size=INFER_INPUT_SIZE,
                 conf_thresh=CONF_THRESH,
                 iou_thresh=IOU_THRESH,
             )
             self.get_logger().info(
-                f'SignDetector listo | modelo={MODEL_PATH}\n'
+                f'SignDetector listo | modelo={model_path}\n'
                 f'  ROI izq=[0-{int(ROI_LEFT_END*100)}%]  '
                 f'der=[{int(ROI_RIGHT_START*100)}-100%]\n'
                 f'  Inferencia a {INFER_HZ} Hz'
