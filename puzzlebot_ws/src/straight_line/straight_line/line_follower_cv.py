@@ -50,16 +50,20 @@ from rclpy.qos          import QoSProfile, QoSReliabilityPolicy, QoSHistoryPolic
 WHEEL_RADIUS = 0.0525
 WHEEL_BASE   = 0.164
 MAX_LINEAR   = 0.20
-MAX_ANGULAR  = 0.20
-LINEAR_VEL   = 0.15
+MAX_ANGULAR  = 0.15   # era 0.20 — techo de velocidad angular
+LINEAR_VEL   = 0.08   # era 0.15 — más lento = más tiempo para corregir
 
 # PD visual
-KP_VIS = 0.9
-KD_VIS = 0.40
+KP_VIS = 0.65   # era 0.9  — reacción más suave al error
+KD_VIS = 0.25   # era 0.40 — derivativo más bajo para evitar picos de velocidad angular
 
-# Filtro exponencial sobre el error (0 = sin filtro, valores altos = más suave)
-# Sube ERROR_ALPHA si el robot sigue oscilando; bájalo si reacciona muy lento
-ERROR_ALPHA = 0.4
+# Filtro exponencial del error  alpha=0 → sin filtro  alpha→1 → muy suave
+# Con alpha=0.65 el robot tarda ~3 frames en responder a un cambio brusco de error
+ERROR_ALPHA = 0.65   # era 0.4
+
+# Zona muerta angular: errores muy pequeños no generan corrección
+# Evita micro-oscilaciones en tramos rectos
+ANGULAR_DEADBAND = 0.04   # rad/s — si |u| < esto → angular.z = 0
 
 # Visión — ROI
 ROI_FRACTION  = 0.40
@@ -91,39 +95,74 @@ STRAIGHT_OVERRIDE_FRAMES = 30
 # EVIDENCIA
 # ─────────────────────────────────────────────────────────────────────────────
 _HOME               = os.environ.get('HOME', '/tmp')
-FRAMES_DIR          = os.path.join(_HOME, 'puzzlebot_evidence', 'line_follower', 'frames')
-EVIDENCE_INTERVAL_S = 5.0      # una foto cada N segundos
-MAX_EVIDENCE_TOTAL  = 10       # máximo de fotos almacenadas
-# Cuando se supera MAX_EVIDENCE_TOTAL se eliminan las más nuevas (mayor timestamp),
-# conservando las primeras fotos tomadas (menor timestamp).
+_EV_BASE            = os.path.join(_HOME, 'puzzlebot_evidence', 'line_follower')
+FRAMES_DIR          = os.path.join(_EV_BASE, 'frames')   # frame original + overlay máscara
+MASKS_DIR           = os.path.join(_EV_BASE, 'masks')    # máscara binaria pura
+EVIDENCE_INTERVAL_S = 5.0
+MAX_EVIDENCE_TOTAL  = 10
+# Política de rotación: se conservan las primeras fotos tomadas (menor timestamp).
+# Cuando se supera MAX_EVIDENCE_TOTAL se eliminan las más recientes.
 
-try:
-    os.makedirs(FRAMES_DIR, exist_ok=True)
-except OSError as _e:
-    import warnings
-    warnings.warn(f'[line_follower] No se pudo crear directorio de evidencia: {_e}')
+for _d in (FRAMES_DIR, MASKS_DIR):
+    try:
+        os.makedirs(_d, exist_ok=True)
+    except OSError as _e:
+        import warnings
+        warnings.warn(f'[line_follower] No se pudo crear {_d}: {_e}')
 
 
-def _save_frame(frame: np.ndarray) -> None:
+def _rotate_keep_oldest(directory: str, pattern: str) -> None:
+    """Elimina los archivos de MAYOR timestamp hasta quedar con MAX_EVIDENCE_TOTAL."""
+    files = sorted(glob.glob(os.path.join(directory, pattern)))
+    # files[0] = más antiguo (menor ts), files[-1] = más reciente (mayor ts)
+    while len(files) > MAX_EVIDENCE_TOTAL:
+        os.remove(files.pop())   # elimina el más reciente
+
+
+def _save_evidence(frame: np.ndarray, mask: np.ndarray) -> None:
     """
-    Guarda una foto. Si hay más de MAX_EVIDENCE_TOTAL archivos elimina los
-    más recientes (mayor timestamp en el nombre), conservando los más antiguos.
+    Guarda dos archivos por cada captura:
+      frames/frame_TS.jpg  → frame original con la máscara superpuesta en cian
+                             para ver exactamente qué píxeles detecta el robot
+      masks/mask_TS.jpg    → máscara binaria pura (blanco = línea detectada)
+
+    Política: se conservan los primeros MAX_EVIDENCE_TOTAL archivos de cada tipo.
     """
     try:
-        ts   = int(time.time() * 1000)
-        path = os.path.join(FRAMES_DIR, f'frame_{ts}.jpg')
-        ok   = cv2.imwrite(path, frame)
-        if not ok:
+        ts = int(time.time() * 1000)
+
+        # ── Imagen compuesta: frame + overlay de máscara ──────────────────
+        composite = frame.copy()
+        # La máscara cubre solo la ROI activa; llevarla a tamaño de frame si hace falta
+        if mask.shape[:2] != frame.shape[:2]:
+            mask_full = np.zeros(frame.shape[:2], dtype=np.uint8)
+            mask_full[:mask.shape[0], :mask.shape[1]] = mask
+        else:
+            mask_full = mask
+
+        # Overlay cian (BGR 255,255,0) donde la máscara es blanca
+        cian_layer        = np.zeros_like(composite)
+        cian_layer[mask_full > 0] = (255, 255, 0)   # cian brillante
+        cv2.addWeighted(cian_layer, 0.5, composite, 1.0, 0, composite)
+
+        # Texto informativo en la imagen compuesta
+        cv2.putText(composite, f't={ts}', (4, 16),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 255), 1)
+
+        # ── Guardar ───────────────────────────────────────────────────────
+        f_path = os.path.join(FRAMES_DIR, f'frame_{ts}.jpg')
+        m_path = os.path.join(MASKS_DIR,  f'mask_{ts}.jpg')
+
+        ok_f = cv2.imwrite(f_path, composite)
+        ok_m = cv2.imwrite(m_path, mask_full)
+
+        if not ok_f or not ok_m:
             import sys
-            print(f'[evidencia] cv2.imwrite falló: {path}', file=sys.stderr)
+            print(f'[evidencia] imwrite falló frame={ok_f} mask={ok_m}', file=sys.stderr)
             return
 
-        # sorted() con nombres frame_TIMESTAMP.jpg ordena de menor a mayor timestamp
-        # → files[0] = más antiguo, files[-1] = más reciente
-        files = sorted(glob.glob(os.path.join(FRAMES_DIR, 'frame_*.jpg')))
-        while len(files) > MAX_EVIDENCE_TOTAL:
-            # Eliminar el MÁS RECIENTE (pop desde el final)
-            os.remove(files.pop())
+        _rotate_keep_oldest(FRAMES_DIR, 'frame_*.jpg')
+        _rotate_keep_oldest(MASKS_DIR,  'mask_*.jpg')
 
     except Exception as exc:
         import sys
@@ -178,7 +217,9 @@ class GridLineDetector:
 
     def process(self, frame: np.ndarray):
         """
-        Retorna (error_norm, found, debug_frame, densities, at_intersection).
+        Retorna (error_norm, found, debug_frame, densities, at_intersection, mask_full).
+        mask_full: máscara binaria del tamaño del frame completo
+                   (blanco = píxeles de línea detectados).
         at_intersection: True si ≥ INTERSECTION_MIN_COLS columnas activas.
         """
         h, w = frame.shape[:2]
@@ -193,6 +234,10 @@ class GridLineDetector:
         gray    = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
         blurred = cv2.GaussianBlur(gray, (BLUR_K, BLUR_K), 0)
         _, mask = cv2.threshold(blurred, THRESH_VAL, 255, cv2.THRESH_BINARY_INV)
+
+        # Máscara del tamaño del frame completo para evidencia
+        mask_full = np.zeros((h, w), dtype=np.uint8)
+        mask_full[roi_y0:h, x0_roi:x1_roi] = mask
 
         col_w     = roi_w / self.n_cols
         densities = np.zeros(self.n_cols, dtype=np.float32)
@@ -258,7 +303,7 @@ class GridLineDetector:
         cv2.putText(debug, state_txt, (x0_roi + 4, roi_y0 - 6),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.55, state_col, 2)
 
-        return error_norm, found, debug, densities, at_intersection
+        return error_norm, found, debug, densities, at_intersection, mask_full
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -391,13 +436,13 @@ class LineFollowerCV(Node):
             self.get_logger().warn(f'cv_bridge error: {e}')
             return
 
-        error_norm, found, debug_frame, densities, at_intersection = \
+        error_norm, found, debug_frame, densities, at_intersection, mask_full = \
             self._detector.process(frame)
 
         # ── Evidencia ────────────────────────────────────────────────────
         now = time.time()
         if now - self._last_evidence_time >= EVIDENCE_INTERVAL_S:
-            _save_frame(frame)
+            _save_evidence(frame, mask_full)
             self._last_evidence_time = now
 
         # ── Intersección (solo si señales activas) ────────────────────────
@@ -524,6 +569,10 @@ class LineFollowerCV(Node):
             d_error = (self._filtered_error - self._prev_error) / dt
             u       = KP_VIS * self._filtered_error + KD_VIS * d_error
             u       = clamp(u, -MAX_ANGULAR, MAX_ANGULAR)
+
+            # Zona muerta: ignorar correcciones muy pequeñas (evita vibración en recta)
+            if abs(u) < ANGULAR_DEADBAND:
+                u = 0.0
 
             cmd.linear.x  = LINEAR_VEL * vel_factor
             cmd.angular.z = u
